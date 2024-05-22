@@ -166,13 +166,10 @@ class API:
                 await websocket.send(
                     self.pipeline.get_global_instrumentation().model_dump_json()
                 )
-            await asyncio.sleep(0.1)
 
         async with asyncio.TaskGroup() as tg:
             tg.create_task(handle_incoming())
             tg.create_task(handle_outgoing())
-
-            await asyncio.Future()  # run forever
 
 
 async def run_pipeline():
