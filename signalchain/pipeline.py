@@ -5,12 +5,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from websockets.server import serve, WebSocketServer
 from collections import defaultdict
-
 from pydantic import BaseModel
 from typing import (
-    Iterable,
     Dict,
-    Generator,
     TypeVar,
     TypedDict,
     Generic,
@@ -26,8 +23,12 @@ PortType = TypeVar("PortType")
 
 class Port(Generic[PortType]):
     queues: List[asyncio.Queue]
+    node_name: str
+    output_name: str
 
-    def __init__(self, queues: List[asyncio.Queue]):
+    def __init__(self, node_name: str, output_name: str, queues: List[asyncio.Queue]):
+        self.node_name = node_name
+        self.output_name = output_name
         self.queues = queues
 
     async def put(self, value: PortType):
@@ -122,10 +123,14 @@ class FourrierNode(SignalProcessingNode):
     inputs = {"main": Signal[float]}
     outputs = {"main": Signal[float]}
 
+    buffer_length: int
+    buffer: np.ndarray
     stopped: bool
 
-    def __init__(self, buffer_length: 10):
+    def __init__(self, buffer_length: int = 10):
         self.stopped = False
+        self.buffer_length = buffer_length
+        self.buffer = np.zeros(shape=(buffer_length,))
 
     async def process(
         self,
@@ -135,11 +140,21 @@ class FourrierNode(SignalProcessingNode):
     ) -> None:
         in_queue = in_queues["main"]
         out_port = out_ports["main"]
+        print(out_port.node_name)
+        print(out_port.queues)
+
+        count = 0
+
         while not self.stopped:
             edge = await in_queue.get()
-
-            val = np.array(np.sin(edge.value))
-            await out_port.put(Signal(val))
+            self.buffer = np.roll(self.buffer, 1)
+            self.buffer[self.buffer_length - 1] = edge.value
+            if count < self.buffer_length:
+                count += 1
+            else:
+                fft = np.fft.fft(self.buffer)
+                print(fft)
+                await out_port.put(Signal(fft))
 
             in_queue.task_done()
 
@@ -198,20 +213,25 @@ class Pipeline:
             for node_name, node in self.nodes.items()
         }
         # need a map of output_node, output_field -> list of
-        subscription_map = defaultdict(list)
+        subscription_map = defaultdict(lambda: defaultdict(list))
         for node_name, queue_map in input_queue_map.items():
             for input_name, queue in queue_map.items():
                 entry = self.input_map[node_name][input_name]
-                subscription_map[entry.output_name].append(queue)
+                subscription_map[entry.node_name][entry.output_name].append(queue)
 
+        print("subscription map", subscription_map)
         # Each output has a port, and it needs to add each input as a subscription
         output_port_map = {
             node_name: {
-                output_name: Port(subscription_map[output_name])
+                output_name: Port(
+                    node_name, output_name, subscription_map[node_name][output_name]
+                )
                 for output_name in node.outputs.keys()
             }
             for node_name, node in self.nodes.items()
         }
+
+        print("output_port_map", output_port_map)
 
         async with asyncio.TaskGroup() as tg:
             node_tasks = {}
