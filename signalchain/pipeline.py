@@ -4,34 +4,51 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from websockets.server import serve, WebSocketServer
+from collections import defaultdict
 
 from pydantic import BaseModel
-from typing import Iterable, Dict, Generator, TypeVar, Generic, Coroutine
+from typing import (
+    Iterable,
+    Dict,
+    Generator,
+    TypeVar,
+    TypedDict,
+    Generic,
+    Coroutine,
+    List,
+    ClassVar,
+    Type,
+)
 import random
+
+PortType = TypeVar("PortType")
+
+
+class Port(Generic[PortType]):
+    queues: List[asyncio.Queue]
+
+    def __init__(self, queues: List[asyncio.Queue]):
+        self.queues = queues
+
+    async def put(self, value: PortType):
+        for queue in self.queues:
+            await queue.put(value)
 
 
 class GlobalInstrumentationMessage(BaseModel):
     time: float
 
 
-InputType = TypeVar("InputType")
+SignalType = TypeVar("SignalType")
 
 
 @dataclass
-class SignalProcessingInput(Generic[InputType]):
+class Signal(Generic[SignalType]):
     time: float
-    inputs: InputType
+    value: SignalType
 
-
-OutputType = TypeVar("OutputType")
-
-
-class SignalProcessingOutput(Generic[OutputType]):
-    output: OutputType
-    time: float
-
-    def __init__(self, output: OutputType):
-        self.output = output
+    def __init__(self, value: SignalType):
+        self.value = value
         self.time = time.time()
 
 
@@ -39,23 +56,40 @@ class SignalInstrumentation:
     pass
 
 
-class SignalProcessingSource(ABC):
+InputSignalDict = Dict[str, Type[Signal]]
+OutputSignalDict = Dict[str, Type[Signal]]
+
+
+class SignalProcessingNode(ABC):
+    inputs: ClassVar[Type[InputSignalDict]]
+    outputs: ClassVar[Type[OutputSignalDict]]
+
     @abstractmethod
     async def process(
-        self, instrumentation: SignalInstrumentation, out_queue: asyncio.Queue[float]
-    ) -> Coroutine: ...
+        self,
+        instrumentation: SignalInstrumentation,
+        in_queues: Dict[str, asyncio.Queue[Signal]],
+        out_ports: Dict[str, Port[Signal]],
+    ) -> None: ...
 
     def stop(self) -> None: ...
 
 
-@dataclass
-class SignalProcessingInput(Generic[InputType]):
-    time: float
-    inputs: InputType
+class RandomSourceInput(TypedDict):
+    pass
 
 
-class RandomSource(SignalProcessingSource):
+class RandomSourceOutput(TypedDict):
+    main: Port[Signal[float]]
+
+
+class RandomSource(SignalProcessingNode):
     stopped: bool
+
+    inputs = {}
+    outputs = {"main": Signal[float]}
+
+    outputs: ClassVar[Type[OutputSignalDict]]
 
     def __init__(self):
         self.stopped = False
@@ -63,29 +97,31 @@ class RandomSource(SignalProcessingSource):
     async def process(
         self,
         instrumentation: SignalInstrumentation,
-        out_queue: asyncio.Queue[SignalProcessingOutput[float]],
+        in_queues: RandomSourceInput,
+        out_ports: RandomSourceOutput,
     ) -> Coroutine:
-
+        out_queue = out_ports["main"]
         while not self.stopped:
             await asyncio.sleep(0.01)
             val = random.random()
-            await out_queue.put(SignalProcessingOutput(val))
+            await out_queue.put(Signal(val))
 
     def stop(self) -> None:
         self.stopped = True
 
 
-class SignalProcessingNode(ABC):
-    @abstractmethod
-    async def process(
-        self,
-        instrumentation: SignalInstrumentation,
-        in_queue: asyncio.Queue[SignalProcessingInput],
-        out_queue: asyncio.Queue[SignalProcessingOutput],
-    ) -> None: ...
+class FourrierNodeInput(TypedDict):
+    main: asyncio.Queue[Signal[float]]
+
+
+class FourrierNodeOutput(TypedDict):
+    main: Port[Signal[np.ndarray]]
 
 
 class FourrierNode(SignalProcessingNode):
+    inputs = {"main": Signal[float]}
+    outputs = {"main": Signal[float]}
+
     stopped: bool
 
     def __init__(self, buffer_length: 10):
@@ -94,15 +130,16 @@ class FourrierNode(SignalProcessingNode):
     async def process(
         self,
         instrumentation: SignalInstrumentation,
-        in_queue: asyncio.Queue[SignalProcessingInput[float]],
-        out_queue: asyncio.Queue[SignalProcessingOutput[np.array]],
+        in_queues: FourrierNodeInput,
+        out_ports: FourrierNodeOutput,
     ) -> None:
+        in_queue = in_queues["main"]
+        out_port = out_ports["main"]
         while not self.stopped:
             edge = await in_queue.get()
 
-            val = np.sin(edge.time)
-            print("producing value", val)
-            await out_queue.put(SignalProcessingOutput(val))
+            val = np.array(np.sin(edge.value))
+            await out_port.put(Signal(val))
 
             in_queue.task_done()
 
@@ -110,42 +147,82 @@ class FourrierNode(SignalProcessingNode):
         self.stopped = True
 
 
+@dataclass
+class NodeInputEntry:
+    node_name: str
+    output_name: str
+
+
+NodeInputs = Dict[str, NodeInputEntry]
+
+
 class Pipeline:
-    sources: Dict[str, SignalProcessingSource]
     instrumentation: SignalInstrumentation
+    nodes: Dict[str, SignalProcessingNode]
+    input_map: Dict[str, NodeInputs]
 
     def __init__(self):
         self.sources = {}
         self.nodes = {}
-        self.clock_period = 0.1
+        self.input_map = {}
         self.instrumentation = SignalInstrumentation()
 
-    def add_source(self, name: str, source: SignalProcessingSource) -> None:
-        assert not name in self.sources
-        self.sources[name] = source
-
-    def add_node(self, name: str, node: SignalProcessingNode) -> None:
+    def add_node(
+        self, name: str, node: SignalProcessingNode, inputs: NodeInputs
+    ) -> None:
         assert not name in self.nodes
         self.nodes[name] = node
+
+        # Validate the types of the pipeline.
+        # for input_name, entry in inputs.items():
+        #    source_node = self.nodes[entry.node_name]
+
+        #    #print(source_node.outputs[entry.output_name].output_type)
+        #    #print(node.inputs[input_name].input_type)
+        #    #assert issubclass(
+        #    #    source_node.outputs[entry.output_name].output_type,
+        #    #    node.inputs[input_name].input_type,
+        #    #)
+
+        self.input_map[name] = inputs
 
     def get_global_instrumentation(self) -> GlobalInstrumentationMessage:
         return GlobalInstrumentationMessage(time=time.time())
 
     async def run_async(self):
-        source_output_queues = {
-            source_name: asyncio.Queue() for source_name in self.sources.keys()
+        # Each input has a queue
+        input_queue_map = {
+            node_name: {
+                input_name: asyncio.Queue() for input_name in node.inputs.keys()
+            }
+            for node_name, node in self.nodes.items()
         }
+        # need a map of output_node, output_field -> list of
+        subscription_map = defaultdict(list)
+        for node_name, queue_map in input_queue_map.items():
+            for input_name, queue in queue_map.items():
+                entry = self.input_map[node_name][input_name]
+                subscription_map[entry.output_name].append(queue)
+
+        # Each output has a port, and it needs to add each input as a subscription
+        output_port_map = {
+            node_name: {
+                output_name: Port(subscription_map[output_name])
+                for output_name in node.outputs.keys()
+            }
+            for node_name, node in self.nodes.items()
+        }
+
         async with asyncio.TaskGroup() as tg:
-            source_tasks = {}
-            for source_name, source in self.sources.items():
-                source_tasks[source_name] = tg.create_task(
-                    source.process(
-                        self.instrumentation, source_output_queues[source_name]
+            node_tasks = {}
+            for node_name, node in self.nodes.items():
+                node_tasks[node_name] = tg.create_task(
+                    node.process(
+                        self.instrumentation,
+                        input_queue_map[node_name],
+                        output_port_map[node_name],
                     )
                 )
-                await source_output_queues[
-                    source_name
-                ].get()  # for now throw this away.
 
             await asyncio.Future()  # run forever
 
@@ -174,7 +251,12 @@ class API:
 
 async def run_pipeline():
     pipeline = Pipeline()
-    pipeline.add_source("random", RandomSource())
+    pipeline.add_node("random", RandomSource(), {})
+    pipeline.add_node(
+        "fourrier",
+        FourrierNode(buffer_length=10),
+        {"main": NodeInputEntry(node_name="random", output_name="main")},
+    )
 
     api = API(pipeline)
     async with asyncio.TaskGroup() as tg:
